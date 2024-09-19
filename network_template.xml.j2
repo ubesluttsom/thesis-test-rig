@@ -1,0 +1,26 @@
+<network xmlns:dnsmasq='http://libvirt.org/schemas/network/dnsmasq/1.0'>
+    <name>{{ network_name }}</name>
+    <bridge name="{{ network.bridge_name }}"/>
+    <dnsmasq:options>
+        <dnsmasq:option value="no-resolv"/>
+        <dnsmasq:option value="log-queries"/>
+        <dnsmasq:option value="log-facility=/var/log/dnsmasq.log"/>
+    </dnsmasq:options>
+    <ip address="{{ network.ip_address }}" netmask="{{ network.netmask }}">
+        <dhcp>
+            <range start="{{ network.dhcp_range_start }}" end="{{ network.dhcp_range_end }}"/>
+            {% for device_name in network.devices %}
+            <host mac="{{ devices[device_name].macs[network_name] }}" name="{{ device_name }}" ip="{{ devices[device_name].ips[network_name] }}"/>
+            {% endfor %}
+        </dhcp>
+    </ip>
+    <dns forwardPlainNames="no">
+        {% for device_name, device_data in devices.items() %}
+        {% for network_key, ip in device_data.ips.items() %}
+        <host ip="{{ ip }}">
+            <hostname>{{ device_name }}</hostname>
+        </host>
+        {% endfor %}
+        {% endfor %}
+    </dns>
+</network>

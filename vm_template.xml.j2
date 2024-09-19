@@ -1,0 +1,31 @@
+<domain type='qemu'>
+  <name>{{ device_name }}</name>
+  <memory unit='KiB'>1024000</memory>
+  <vcpu placement='static'>1</vcpu>
+  <cpu mode='custom' match='exact'>
+    <model fallback='allow'>cortex-a72</model>
+  </cpu>
+  <os>
+    <type arch='aarch64' machine='virt'>hvm</type>
+    <kernel>/alpine/linux/arch/arm64/boot/Image</kernel>
+    <cmdline>console=ttyAMA0 root=/dev/vda vm={{ device_name }}</cmdline>
+  </os>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <transient shareBacking='yes'/>
+      <source file='/alpine/alpine-rootfs/rootfs.img'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    {% for network_name, mac_address in device.macs.items() %}
+    <interface type='network'>
+      <mac address='{{ mac_address }}'/>
+      <source network='{{ network_name }}'/>
+      <model type='virtio'/>
+    </interface>
+    {% endfor %}
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+  </devices>
+</domain>
