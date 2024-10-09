@@ -1,4 +1,4 @@
-two_sender_context = {
+context = {
     "networks": {
         "net1": {
             "bridge_name": "virbr1",
@@ -61,7 +61,7 @@ two_sender_context = {
     },
 }
 
-context = {
+one_sender_context = {
     "networks": {
         "net1": {
             "bridge_name": "virbr1",
@@ -108,7 +108,7 @@ context = {
     },
 }
 
-star_topology_context = {
+three_sender_context = {
     "networks": {
         "net1": {
             "bridge_name": "virbr1",
