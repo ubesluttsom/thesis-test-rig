@@ -1,33 +1,9 @@
-import subprocess
-from generate_config import context
-
-# Extract networks and devices from context
-networks = context["networks"]
-devices = context["devices"]
-
-
-def run(command, check=True):
-    """Helper function to run shell commands"""
-    return subprocess.run(command, shell=True, check=check, text=True)
-
-
-def broadcast(message):
-    """Broadcast message to all attached shells"""
-    yellow = "\033[33m"
-    nc = "\033[0m"
-    for tty in subprocess.run(
-        "ls /dev/pts/*", shell=True, capture_output=True, text=True
-    ).stdout.splitlines():
-        run(f'echo -e "\\r{yellow}{message}{nc}" > {tty}', check=False)
-
-
-def wait_for_condition(command):
-    """Wait until a condition is true"""
-    while run(command, check=False).returncode != 0:
-        subprocess.run("sleep 1", shell=True)
+from config import configure_topology, networks, devices
+from utils import *
 
 
 def main():
+    configure_topology(senders=3)
     broadcast("Starting openrc system and daemons ...")
     run("openrc sysinit")
     run("rc-service dbus start")

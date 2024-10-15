@@ -1,62 +1,89 @@
 #!/usr/bin/env python3
 
-import subprocess
 from pathlib import Path
 from itertools import product
 
-from config import *
+from utils import *
+from config import configure_topology
+
+def main():
+    global hosts, routers, vms
+    try:
+        # Configure topology and create host symbols
+        topology = configure_topology(senders=2)
+        hosts = topology.hosts
+        routers = topology.routers
+        vms = topology.vms
+
+        # Create a common timestamp for all log files of this run
+        log_timestamp = timestamp()
+
+        # Ensure hosts are initialised properly
+        base_configuration()
+
+        # Execute actual tests
+        execute_test(log_timestamp, "lgc", max_rate=200)
+        execute_test(log_timestamp, "lgcc", max_rate=200, min_rtt=2000)
+        execute_test(log_timestamp, "dctcp")
+        execute_test(log_timestamp, "cubic")
+
+        green("Test complete!")
+    except RuntimeError as e:
+        print(e)
+        error()
 
 
-def run(command, **kwargs):
-    """Helper function to run shell commands"""
-    return subprocess.run(command, shell=True, check=True, text=True, **kwargs)
+def execute_test(timestamp, congestion_control, max_rate=None, min_rtt=None):
+    blue(f"[{congestion_control.upper()}]")
 
+    # Make sure no tests are currently running, and clean up old log files
+    kill_ss()
+    kill_ping()
+    kill_iperf()
+    rm_logs()
 
-def ssh(
-    host, command, background=False, devnull=False, stdout=None, stderr=None, **kwargs
-):
-    """Helper to run SSH commands on a remote host"""
-    cmd = ["ssh", host, command]
+    # LGCC needs the PEP active
+    if congestion_control == "lgcc":
+        pepdna_enable()
 
-    stdout = subprocess.DEVNULL if devnull else stdout
-    stderr = subprocess.DEVNULL if devnull else stderr
+    # Set the propper congestion control
+    cong(congestion_control, max_rate, min_rtt)
 
-    if background:
-        return subprocess.Popen(cmd, stdout=stdout, stderr=stderr, **kwargs)
-    else:
-        return subprocess.run(cmd, stdout=stdout, stderr=stderr, **kwargs)
+    # Configure queing discipline based on selected congestion control
+    if congestion_control in ["lgcc", "lgc", "dctcp"]:
+        qdisc(congestion_control, red=True)
+    else:   # CUBIC, Reno, BBR, ...
+        qdisc(congestion_control, red=False)
 
+    # Start logging of `cwnd`
+    start_ss(congestion_control)
 
-def colored_output(message, color_code):
-    print(f"\033[{color_code}m{message}\033[0m")
+    # Start logging of RTT from `ping`
+    start_ping(congestion_control)
 
+    # Do actual network performance tests
+    iperf3(congestion_control)
 
-def blue(message):
-    colored_output(message, "34")
+    # Stop logging of RTT from `ping`
+    kill_ping()
 
+    # Stop logging of `cwnd`
+    kill_ss()
 
-def yellow(message):
-    colored_output(message, "33")
+    # Disable the PEP
+    if congestion_control == "lgcc":
+        pepdna_disable()
 
-
-def green(message):
-    colored_output(message, "32")
-
-
-def red(message):
-    colored_output(message, "31")
+    # Fetch the logs of the test
+    copy_logs(timestamp, congestion_control)
 
 
 def error():
     red("[ERROR] Cleaning up ...")
-    stop_ss()
+    kill_iperf()
+    kill_ss()
+    kill_ping()
     exit(1)
-
-
-def stop_ss():
-    yellow("Kill ./ss.sh on the VMs ...")
-    for host in hosts:
-        ssh(host, "pkill -f ss.sh")
 
 
 def start_ss(cong):
@@ -64,6 +91,27 @@ def start_ss(cong):
     for host in hosts:
         ssh(host, f"./ss.sh --daemon /root/ss_{cong}_{host}.log")
 
+
+def kill_ss():
+    yellow("Kill ./ss.sh on the VMs ...")
+    for host in hosts:
+        ssh(host, "pkill -f ss.sh")
+
+
+def start_ping(cong, server="vm1"):
+    yellow(f"Start ping on the VMs ...")
+    for host in vms.keys() - {server}:
+        logfile = f"/root/ping_{cong}_{host}.log"
+        cmd = f"""
+        date -u +%Y-%m-%dT%H:%M:%S.%3N > {logfile}
+        nohup ping -i 0.1 -s 4 vm1 >> {logfile} &
+        """
+        ssh(host, cmd)
+
+def kill_ping():
+    yellow("Kill ping on the VMs ...")
+    for host in hosts:
+        ssh(host, "pkill -f ping")
 
 def iperf3(cong, server="vm1", reverse=False):
     yellow("Running iperf3 tests ...")
@@ -92,6 +140,7 @@ def iperf3(cong, server="vm1", reverse=False):
             f"--time {60} "
             f"--interval 0.1 "
             f"{'--reverse ' if reverse else ''}"
+            # f"--bidir "
             f"--json "
             f"--logfile {recv_log_path if reverse else sndr_log_path}"
         )
@@ -105,12 +154,12 @@ def iperf3(cong, server="vm1", reverse=False):
         proc.wait()
 
 
-def copy_logs(suffix):
+def copy_logs(timestamp, suffix):
     def cat_files(hosts, basename):
         for host in hosts:
             files = ssh(host, f"ls {basename}", capture_output=True).stdout.split()
             for file in map(lambda b: b.decode("utf-8"), files):
-                with Path(f"/alpine/data-analysis/logs/{file}").open("w") as f:
+                with Path(f"/alpine/data-analysis/logs/{timestamp}_{file}").open("w") as f:
                     ssh(host, f"cat {file}", stdout=f)
 
     yellow(f"Copy *_{suffix}.log* files ...")
@@ -150,7 +199,7 @@ def shq(bandwidth=50, rtt=3, delay=1):
         ssh(router, cmd)
 
 
-def qdisc(bandwidth=250, delay=0, red=True, quantum=300, ssh_class=False):
+def qdisc(congestion_control=None, bandwidth=250, rtt=0.004, delay=0, red=True, quantum=300, ssh_class=False):
     """
     Configure the qdiscs.
     """
@@ -174,7 +223,6 @@ def qdisc(bandwidth=250, delay=0, red=True, quantum=300, ssh_class=False):
 
         if ssh_class:
             # Prioritize SSH traffic on port 22, bypassing other AQMs and limits
-            # (Let's not shoot ourselfs in the foot.)
             cmd += f"""
             # Class for SSH traffic, bypassing other AQMs
             tc class add dev eth{i} parent 1: classid 1:22 htb rate 100mbit ceil 100mbit quantum {quantum};
@@ -202,19 +250,22 @@ def qdisc(bandwidth=250, delay=0, red=True, quantum=300, ssh_class=False):
 
         # Add RED to routers.
         if red:
-            # maxp = 1.0  # mark all packets above `maxth` queue length
-            # avpkt = 1500  # 3629   # based on tcpdump analysis
-            # burst = 1
-            # minth = avpkt * 1
-            # maxth = avpkt * 100
-            # limit = avpkt * 1000  # hard queue length limit
-            maxp = 1.0
-            avpkt = 1500
-            burst = 1
-            k = 1
-            minth = avpkt * k
-            maxth = avpkt * (k+1)
-            limit = avpkt * 16
+
+            maxp = 1.0  # mark all packets above `maxth` queue length
+            avpkt = 1500  # Or 3629, based on tcpdump analysis
+            limit = avpkt * 100
+
+            if congestion_control == "dctcp":
+                # Default DCTCP configuration
+                burst = 0
+                # k > (C * RTT) / 7
+                k = k if (k := round((((bandwidth*1024)/avpkt)*rtt)/7)) > 0 else 1
+                minth = avpkt * k
+                maxth = avpkt * (k+1)
+            else:
+                burst = 1
+                minth = avpkt * 1
+                maxth = avpkt * 14
 
             cmd += f"""
             tc qdisc add dev eth{i} parent {handle} handle {(handle := "11:")} red limit {limit} min {minth} max {maxth} avpkt {avpkt} bandwidth {bandwidth}mbit ecn probability {maxp} burst {burst};
@@ -262,38 +313,38 @@ def base_configuration():
         ssh(host, cmd)
 
 
-def cong(congestion_control, lgc_max_rate=None, lgc_min_rtt=None):
-    yellow(f"Activating {congestion_control} congestion control ...")
+def cong(congestion_control, max_rate=None, min_rtt=None):
+    yellow(f"Activating {(cc := congestion_control)} congestion control ...")
     for host in hosts:
         cmd = ""
 
-        # Add congestion control (this will be formated appropriatly further down)
-        cmd += f"sysctl -w net.ipv4.tcp_congestion_control={congestion_control};"
+        # Add congestion control
+        cmd += f"sysctl -w net.ipv4.tcp_congestion_control={cc};"
 
         # Add extra configuration steps for LGC(C)
-        if congestion_control == "lgc":
+        if cc in ["lgc", "lgcc"]:
             # Set max rate
-            if lgc_max_rate:
-                cmd += f"sysctl -w net.ipv4.lgc.lgc_max_rate={lgc_max_rate};"
+            if max_rate:
+                cmd += f"sysctl -w net.ipv4.{cc}.{cc}_max_rate={max_rate};"
 
-            # Configure RTT
-            rtt = (
-                # int(lgc_min_rtt / 2)
-                lgc_min_rtt
-                if lgc_min_rtt and host in routers
-                else lgc_min_rtt
-            )
-            if lgc_min_rtt:
-                cmd += f"sysctl -w net.ipv4.lgc.lgc_min_rtt={rtt};"
+            if cc == "lgcc" and min_rtt:
+                # Configure RTT
+                rtt = (
+                    # int(lgc_min_rtt / 2)
+                    min_rtt
+                    if min_rtt and host in routers
+                    else min_rtt
+                )
+                cmd += f"sysctl -w net.ipv4.{cc}.{cc}_min_rtt={rtt};"
 
             # Exponential smoothing paramter (default: `round(0.05*2**16)`)
             α = round(0.05 * 2**16)
-            cmd += f"echo {α} > /sys/module/tcp_lgc/parameters/lgc_alpha_16;"
+            cmd += f"echo {α} > /sys/module/tcp_{cc}/parameters/{cc}_alpha_16;"
 
             # Threshold: if percentage of CE marked packets are above this, be more
             # aggressive in reducing rate. (default: `round(0.8*2**16)`)
             thresh = round(0.8 * 2**16)
-            cmd += f"echo {thresh} > /sys/module/tcp_lgc/parameters/thresh_16;"
+            cmd += f"echo {thresh} > /sys/module/tcp_{cc}/parameters/thresh_16;"
 
         cmd += "sysctl -p;"
 
@@ -378,53 +429,19 @@ def pepdna_disable():
         ssh(router, cmd)
 
 
-def execute_test(scenario_name, congestion_control, max_rate=None, min_rtt=None):
-    blue(f"[{scenario_name.upper()}]")
-    kill_iperf_and_rm_logs()
+def kill_iperf():
+    yellow("Kill existing iperf3 instances ...")
+    for host in hosts:
+        ssh(host, "pkill iperf3 || true", check=False)
 
-    if scenario_name.upper() == "LGCC":
-        pepdna_enable()
-
-    cong(congestion_control, max_rate, min_rtt)
-
-    if scenario_name.upper() in ["LGCC", "LGC", "DCTCP"]:
-        qdisc(red=True)
-    else:   # CUBIC, Reno, BBR, ...
-        qdisc(red=False)
-
-    start_ss(scenario_name)
-    iperf3(scenario_name)
-    stop_ss()
-
-    if scenario_name.upper() == "LGCC":
-        pepdna_disable()
-
-    copy_logs(scenario_name)
-
-
-def kill_iperf_and_rm_logs():
-    yellow("Kill existing iperf3 instances on VMs and remove old log files ...")
+def rm_logs():
+    yellow(" Remove old log files ...")
     cmd = """
-    pkill iperf3 || true;
     rm -f /root/*.log;
     rm -f /root/*.log.json;
     """
     for host in hosts:
         ssh(host, cmd, check=False)
-
-
-def main():
-    try:
-        stop_ss()
-        base_configuration()
-        execute_test("lgcc", "lgc", 200, 21000)
-        execute_test("dctcp", "dctcp")
-        execute_test("cubic", "cubic")
-
-        green("Test complete!")
-    except subprocess.CalledProcessError as e:
-        print(e)
-        error()
 
 
 if __name__ == "__main__":

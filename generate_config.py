@@ -1,7 +1,12 @@
 from jinja2 import Environment, FileSystemLoader
 from config import context
+from config import configure_topology
 
 def main():
+
+    # Load correct context from topology
+    context = configure_topology(senders=3).context
+
     # Load the template
     file_loader = FileSystemLoader(".")
     env = Environment(
@@ -29,23 +34,11 @@ def main():
         with open(f"{device_name}.xml", "w") as f:
             f.write(output)
 
-    # # Render the entrypoint.sh template
-    # template = env.get_template("entrypoint.sh.j2")
-    # output = template.render(networks=context["networks"], devices=context["devices"])
-    # with open("entrypoint.sh", "w") as f:
-    #     f.write(output)
-
     # Render the routing table script
     template = env.get_template("routing_table.sh.j2")
     output = template.render(devices=context["devices"])
     with open("routing_table.sh", "w") as f:
         f.write(output)
-
-    # # Render the test script
-    # template = env.get_template("test.sh.j2")
-    # output = template.render(devices=context["devices"])
-    # with open("test.sh", "w") as f:
-    #     f.write(output)
 
     print("Templates rendered successfully.")
 

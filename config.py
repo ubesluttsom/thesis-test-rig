@@ -1,4 +1,51 @@
-context = {
+one_sender_context = {
+    "networks": {
+        "net1": {
+            "bridge_name": "virbr1",
+            "ip_address": "10.0.1.1",
+            "netmask": "255.255.255.0",
+            "dhcp_range_start": "10.0.1.100",
+            "dhcp_range_end": "10.0.1.200",
+            "devices": ["router1", "vm1"],
+        },
+        "net2": {
+            "bridge_name": "virbr2",
+            "ip_address": "10.0.2.1",
+            "netmask": "255.255.255.0",
+            "dhcp_range_start": "10.0.2.100",
+            "dhcp_range_end": "10.0.2.200",
+            "devices": ["router1", "vm2"],
+        },
+    },
+    "devices": {
+        "router1": {
+            "macs": {
+                "net1": "52:54:00:01:00:01",
+                "net2": "52:54:00:01:00:02",
+            },
+            "ips": {
+                "net1": "10.0.1.100",
+                "net2": "10.0.2.100",
+            },
+            "routes": {
+                "10.0.1.0/24": "10.0.1.101",
+                "10.0.2.0/24": "10.0.2.101",
+            },
+        },
+        "vm1": {
+            "macs": {"net1": "52:54:00:00:01:01"},
+            "ips": {"net1": "10.0.1.101"},
+            "default_gateway": "10.0.1.100",
+        },
+        "vm2": {
+            "macs": {"net2": "52:54:00:00:02:01"},
+            "ips": {"net2": "10.0.2.101"},
+            "default_gateway": "10.0.2.100",
+        },
+    },
+}
+
+two_sender_context = {
     "networks": {
         "net1": {
             "bridge_name": "virbr1",
@@ -57,53 +104,6 @@ context = {
             "macs": {"net3": "52:54:00:00:03:01"},
             "ips": {"net3": "10.0.3.101"},
             "default_gateway": "10.0.3.100",
-        },
-    },
-}
-
-one_sender_context = {
-    "networks": {
-        "net1": {
-            "bridge_name": "virbr1",
-            "ip_address": "10.0.1.1",
-            "netmask": "255.255.255.0",
-            "dhcp_range_start": "10.0.1.100",
-            "dhcp_range_end": "10.0.1.200",
-            "devices": ["router1", "vm1"],
-        },
-        "net2": {
-            "bridge_name": "virbr2",
-            "ip_address": "10.0.2.1",
-            "netmask": "255.255.255.0",
-            "dhcp_range_start": "10.0.2.100",
-            "dhcp_range_end": "10.0.2.200",
-            "devices": ["router1", "vm2"],
-        },
-    },
-    "devices": {
-        "router1": {
-            "macs": {
-                "net1": "52:54:00:01:00:01",
-                "net2": "52:54:00:01:00:02",
-            },
-            "ips": {
-                "net1": "10.0.1.100",
-                "net2": "10.0.2.100",
-            },
-            "routes": {
-                "10.0.1.0/24": "10.0.1.101",
-                "10.0.2.0/24": "10.0.2.101",
-            },
-        },
-        "vm1": {
-            "macs": {"net1": "52:54:00:00:01:01"},
-            "ips": {"net1": "10.0.1.101"},
-            "default_gateway": "10.0.1.100",
-        },
-        "vm2": {
-            "macs": {"net2": "52:54:00:00:02:01"},
-            "ips": {"net2": "10.0.2.101"},
-            "default_gateway": "10.0.2.100",
         },
     },
 }
@@ -322,43 +322,78 @@ class VM(Host):
     def __repr__(self):
         return f"<VM(name={self.name}, macs={self.macs}, ips={self.ips}, default_gateway={self.default_gateway})>"
 
-# Convenience dictionary:
 
-hosts = {}
-routers = {}
-vms = {}
+class Topology:
+    def __init__(self, hosts, routers, vms, networks, devices, context):
+        self.hosts = hosts
+        self.routers = routers
+        self.vms = vms
+        self.networks = networks
+        self.devices = devices
+        self.context = context
 
-for device_name, device_attrs in context['devices'].items():
-    if 'routes' in device_attrs:  # It's a router
-        router = Router(
-            name=device_name,
-            macs=device_attrs.get('macs', {}),
-            ips=device_attrs.get('ips', {}),
-            routes=device_attrs.get('routes', {}),
-        )
-        routers[device_name] = router
-        hosts[device_name] = router  # Routers are also hosts
-    elif 'default_gateway' in device_attrs:  # It's a VM
-        vm = VM(
-            name=device_name,
-            macs=device_attrs.get('macs', {}),
-            ips=device_attrs.get('ips', {}),
-            default_gateway=device_attrs.get('default_gateway'),
-        )
-        vms[device_name] = vm
-        hosts[device_name] = vm  # VMs are also hosts
-    else:  # It's a generic host
-        host = Host(
-            name=device_name,
-            macs=device_attrs.get('macs', {}),
-            ips=device_attrs.get('ips', {}),
-        )
-        hosts[device_name] = host
+    def __repr__(self):
+        return f"Topology(hosts={self.hosts}, routers={self.routers}, vms={self.vms}, networks={self.networks}, devices={self.devices})"
 
-# These lists can be imported from this module:
-# from config import hosts, routers, vms
+
+def configure_topology(senders):
+    context = {}
+    if senders == 1:
+        context = one_sender_context
+    elif senders == 2:
+        context = two_sender_context
+    elif senders == 3:
+        context = three_sender_context
+    else:
+        raise ValueError(f"Unsupported number of senders: {senders}")
+
+    # Rebuild hosts, routers, vms based on the selected context
+    hosts = {}
+    routers = {}
+    vms = {}
+
+    # Network and devices can be copied directly
+    networks = context["networks"]
+    devices = context["devices"]
+
+    for device_name, device_attrs in context['devices'].items():
+        if 'routes' in device_attrs:  # It's a router
+            router = Router(
+                name=device_name,
+                macs=device_attrs.get('macs', {}),
+                ips=device_attrs.get('ips', {}),
+                routes=device_attrs.get('routes', {}),
+            )
+            routers[device_name] = router
+            hosts[device_name] = router  # Routers are also hosts
+        elif 'default_gateway' in device_attrs:  # It's a VM
+            vm = VM(
+                name=device_name,
+                macs=device_attrs.get('macs', {}),
+                ips=device_attrs.get('ips', {}),
+                default_gateway=device_attrs.get('default_gateway'),
+            )
+            vms[device_name] = vm
+            hosts[device_name] = vm  # VMs are also hosts
+        else:  # It's a generic host
+            host = Host(
+                name=device_name,
+                macs=device_attrs.get('macs', {}),
+                ips=device_attrs.get('ips', {}),
+            )
+            hosts[device_name] = host
+
+    return Topology(
+        hosts,
+        routers,
+        vms,
+        networks,
+        devices,
+        context,
+    )
 
 if __name__ == '__main__':
-    print("Hosts:", hosts)
-    print("Routers:", routers)
-    print("VMs:", vms)
+    topo = configure_topology(senders=3)
+    print("Hosts:", topo.hosts)
+    print("Routers:", topo.routers)
+    print("VMs:", topo.vms)
