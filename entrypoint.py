@@ -1,9 +1,14 @@
-from config import configure_topology, networks, devices
+#!/usr/bin/env python3
+
+from config import configure_topology
 from utils import *
 
 
 def main():
-    configure_topology(senders=3)
+    topology = configure_topology(senders=3)
+    networks = topology.networks
+    devices = topology.devices
+
     broadcast("Starting openrc system and daemons ...")
     run("openrc sysinit")
     run("rc-service dbus start")
@@ -59,13 +64,11 @@ Host *
         broadcast(f" | {device} ...")
         wait_for_condition(f"nc -z {device} 22")
 
-    broadcast("Setting up routing tables for routers ...")
+    broadcast("Setup IP forwarding in routers ...")
     for device, data in devices.items():
         if "routes" in data:
             broadcast(f" | {device} ...")
             run(f"ssh {device} sysctl -w net.ipv4.ip_forward=1")
-            # for subnet, next_hop in data["routes"].items():
-            #     run(f"ssh {device} ip route add {subnet} via {next_hop}")
 
     broadcast("Add default gateways for end nodes ...")
     for device, data in devices.items():
@@ -74,13 +77,6 @@ Host *
             run(
                 f"ssh {device} ip route add default via {data['default_gateway']}"
             )
-
-    broadcast("Activate PEP-DNA in test rig ...")
-    for device in devices.keys():
-        # run(f"ssh {device} /root/cong.sh lgc 100")
-        if device.startswith("router"):
-            broadcast(f" | {device} ...")
-            run(f"ssh {device} /root/pepdna.sh")
 
     broadcast("\033[32mVM initialization finished!\033[0m")
 
