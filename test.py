@@ -1,31 +1,41 @@
 #!/usr/bin/env python3
 
+from time import sleep
 from pathlib import Path
 from itertools import product
 
 from utils import *
 from config import configure_topology
 
+
 def main():
     global hosts, routers, vms
     try:
         # Configure topology and create host symbols
-        topology = configure_topology(senders=2)
-        hosts = topology.hosts
-        routers = topology.routers
-        vms = topology.vms
+        topology = configure_topology(senders=3)
+        hosts, routers, vms = (topology.hosts, topology.routers, topology.vms)
 
         # Create a common timestamp for all log files of this run
-        log_timestamp = timestamp()
+        t = timestamp()
 
         # Ensure hosts are initialised properly
         base_configuration()
 
+        # If delay is specified, add netem qdisc on ingress
+        # if (delay_ms := 10):
+        #     setup_ingress_delay(delay_ms)
+
+        # pepdna_enable()
+
         # Execute actual tests
-        execute_test(log_timestamp, "lgc", max_rate=200)
-        execute_test(log_timestamp, "lgcc", max_rate=200, min_rtt=2000)
-        execute_test(log_timestamp, "dctcp")
-        execute_test(log_timestamp, "cubic")
+        # execute_test(t, "lgc", max_rate=200)
+        execute_test(t, "lgcc", max_rate=200, min_rtt=102000, static_rtt=0)
+        # execute_test(t, "dctcp")
+        # execute_test(t, "bbr")
+        # execute_test(t, "cubic")
+
+        # Remove virtual devices created to induce delay
+        # cleanup_ifb()
 
         green("Test complete!")
     except RuntimeError as e:
@@ -33,7 +43,9 @@ def main():
         error()
 
 
-def execute_test(timestamp, congestion_control, max_rate=None, min_rtt=None):
+def execute_test(
+    timestamp, congestion_control, max_rate=None, min_rtt=None, static_rtt=1
+):
     blue(f"[{congestion_control.upper()}]")
 
     # Make sure no tests are currently running, and clean up old log files
@@ -47,12 +59,12 @@ def execute_test(timestamp, congestion_control, max_rate=None, min_rtt=None):
         pepdna_enable()
 
     # Set the propper congestion control
-    cong(congestion_control, max_rate, min_rtt)
+    cong(congestion_control, max_rate, min_rtt, static_rtt)
 
     # Configure queing discipline based on selected congestion control
     if congestion_control in ["lgcc", "lgc", "dctcp"]:
         qdisc(congestion_control, red=True)
-    else:   # CUBIC, Reno, BBR, ...
+    else:  # CUBIC, Reno, BBR, ...
         qdisc(congestion_control, red=False)
 
     # Start logging of `cwnd`
@@ -64,15 +76,14 @@ def execute_test(timestamp, congestion_control, max_rate=None, min_rtt=None):
     # Do actual network performance tests
     iperf3(congestion_control)
 
-    # Stop logging of RTT from `ping`
+    # Stop logging of RTT from `ping`, and stop logging of `cwnd`
     kill_ping()
-
-    # Stop logging of `cwnd`
     kill_ss()
+    sleep(1)
 
-    # Disable the PEP
-    if congestion_control == "lgcc":
-        pepdna_disable()
+    # # Disable the PEP
+    # if congestion_control == "lgcc":
+    #     pepdna_disable()
 
     # Fetch the logs of the test
     copy_logs(timestamp, congestion_control)
@@ -108,12 +119,14 @@ def start_ping(cong, server="vm1"):
         """
         ssh(host, cmd)
 
+
 def kill_ping():
     yellow("Kill ping on the VMs ...")
     for host in hosts:
         ssh(host, "pkill -f ping")
 
-def iperf3(cong, server="vm1", reverse=False):
+
+def iperf3(cong, server="vm1", time=60, interval=20, reverse=False):
     yellow("Running iperf3 tests ...")
 
     processes = []
@@ -137,17 +150,16 @@ def iperf3(cong, server="vm1", reverse=False):
             f"iperf3 "
             f"--client {server} "
             f"--port {port} "
-            f"--time {60} "
+            f"--time {time} "
             f"--interval 0.1 "
             f"{'--reverse ' if reverse else ''}"
-            # f"--bidir "
             f"--json "
             f"--logfile {recv_log_path if reverse else sndr_log_path}"
         )
 
         ssh(server, cmd_server)
         processes.append(ssh(host, cmd_client, background=True))
-        run("sleep 20")
+        run(f"sleep {interval}")
 
     yellow(" | Waiting for the iperf3 flows to complete ...")
     for proc in processes:
@@ -159,7 +171,9 @@ def copy_logs(timestamp, suffix):
         for host in hosts:
             files = ssh(host, f"ls {basename}", capture_output=True).stdout.split()
             for file in map(lambda b: b.decode("utf-8"), files):
-                with Path(f"/alpine/data-analysis/logs/{timestamp}_{file}").open("w") as f:
+                with Path(f"/alpine/data-analysis/logs/{timestamp}_{file}").open(
+                    "w"
+                ) as f:
                     ssh(host, f"cat {file}", stdout=f)
 
     yellow(f"Copy *_{suffix}.log* files ...")
@@ -199,79 +213,173 @@ def shq(bandwidth=50, rtt=3, delay=1):
         ssh(router, cmd)
 
 
-def qdisc(congestion_control=None, bandwidth=250, rtt=0.004, delay=0, red=True, quantum=300, ssh_class=False):
+def qdisc_new(congestion_control=None, bandwidth=250, rtt=0.044, delay=10, red=True):
     """
-    Configure the qdiscs.
+    Configure the qdiscs with a structure using netem for delay, HTB for rate limiting, and RED for congestion control.
     """
     yellow(f"Deleting existing qdiscs and activating special RED with ECN ...")
     for host, i in [(host, i) for host in hosts for i in range(len(hosts[host].macs))]:
         print(f"Configuring qdisc on {host}, eth{i}")
 
-        # Last handle
-        handle = "root"
-
         # Remove existing qdiscs
         cmd = f"""
-        tc qdisc del dev eth{i} {handle} 2>/dev/null || true;
+        set -e;
+        tc qdisc del dev eth{i} root 2>/dev/null || true;
         """
 
-        # Create the main HTB class for the traffic, with bandwidth limit
+        # Define handles
+        netem_handle = "10:"
+        htb_handle = "1:1"
+        red_handle = "20:"
+
+        # Add netem qdisc for delay
         cmd += f"""
-        tc qdisc add dev eth{i} {handle} handle {(handle := "1:")} htb default 10;
-        tc class add dev eth{i} parent {handle} classid {(handle := "1:10")} htb rate {bandwidth}mbit ceil {bandwidth}mbit quantum {quantum};
+        tc qdisc add dev eth{i} root handle {netem_handle} netem delay {delay}ms;
         """
 
-        if ssh_class:
-            # Prioritize SSH traffic on port 22, bypassing other AQMs and limits
-            cmd += f"""
-            # Class for SSH traffic, bypassing other AQMs
-            tc class add dev eth{i} parent 1: classid 1:22 htb rate 100mbit ceil 100mbit quantum {quantum};
-            tc qdisc add dev eth{i} parent 1:22 handle 22: fq;
+        # Add HTB qdisc for rate limiting as a child of netem
+        cmd += f"""
+        tc qdisc add dev eth{i} parent {netem_handle} handle {htb_handle} htb default 1;
 
-            # Filter to match outgoing SSH traffic (port 22)
-            tc filter add dev eth{i} protocol ip prio 1 u32 match ip dport 22 0xffff flowid 1:22;
+        # Add HTB class for rate limiting
+        tc class add dev eth{i} parent {htb_handle} classid 1:1 htb rate {bandwidth}mbit ceil {bandwidth}mbit quantum 300;
+        """
 
-            # Filter to match incoming SSH traffic (port 22)
-            tc filter add dev eth{i} protocol ip prio 1 u32 match ip sport 22 0xffff flowid 1:22;
-            """
-
-        # On end hosts, execute the command without configuring RED or delay
+        # On end hosts, execute the command without configuring RED
         if host not in routers:
-            cmd += f"""
-            tc qdisc add dev eth{i} parent {handle} fq maxrate {bandwidth}mbit;
-            """
+            # cmd += f"""
+            # tc qdisc add dev eth{i} parent 1:1 handle {red_handle} fq maxrate {bandwidth}mbit;
+            # """
             ssh(host, cmd)
             continue
 
-        if delay:
-            cmd += f"""
-            tc qdisc add dev eth{i} parent {handle} handle {(handle := "10:")} netem delay {delay}ms;
-            """
-
-        # Add RED to routers.
+        # Add RED to routers if enabled
         if red:
-
             maxp = 1.0  # mark all packets above `maxth` queue length
-            avpkt = 1500  # Or 3629, based on tcpdump analysis
+            avpkt = 1500  # Average packet size
             limit = avpkt * 100
 
             if congestion_control == "dctcp":
                 # Default DCTCP configuration
                 burst = 0
-                # k > (C * RTT) / 7
-                k = k if (k := round((((bandwidth*1024)/avpkt)*rtt)/7)) > 0 else 1
+                k = max(round((((bandwidth * 1024) / avpkt) * rtt) / 7), 1)
                 minth = avpkt * k
-                maxth = avpkt * (k+1)
+                maxth = avpkt * (k + 1)
             else:
                 burst = 1
                 minth = avpkt * 1
                 maxth = avpkt * 14
 
             cmd += f"""
-            tc qdisc add dev eth{i} parent {handle} handle {(handle := "11:")} red limit {limit} min {minth} max {maxth} avpkt {avpkt} bandwidth {bandwidth}mbit ecn probability {maxp} burst {burst};
+            tc qdisc add dev eth{i} parent 1:1 handle {red_handle} red limit {limit} min {minth} max {maxth} avpkt {avpkt} bandwidth {bandwidth}mbit ecn probability {maxp} burst {burst};
             """
 
         # Execute the command on the router
+        ssh(host, cmd)
+
+
+def qdisc(
+    congestion_control=None,
+    bandwidth=300,
+    rtt=0.045,
+    red=True,
+    quantum=300,
+    ssh_class=False,
+):
+    """
+    Configure the qdiscs.
+    """
+
+    yellow(f"Deleting existing qdiscs and activating special RED with ECN ...")
+    for host, i in [(host, i) for host in hosts for i in range(len(hosts[host].macs))]:
+        print(f"Configuring qdisc on {host}, eth{i}")
+
+        # Remove existing qdiscs
+        cmd = f"""
+        tc qdisc del dev eth{i} root 2>/dev/null || true;
+        """
+
+        # Define handles
+        htb_handle = "1:"
+        default_classid = "1:10"
+        red_handle = "11:"
+        ssh_classid = "1:22"
+
+        # Add HTB qdisc at root
+        cmd += f"""
+        tc qdisc add dev eth{i} root handle {htb_handle} htb default 10;
+        """
+
+        # Add default HTB class
+        cmd += f"""
+        tc class add dev eth{i} \
+            parent {htb_handle} classid {default_classid} \
+            htb rate {bandwidth}mbit ceil {bandwidth}mbit quantum {quantum};
+        """
+
+        # On end hosts, execute the command without configuring RED
+        if host not in routers:
+            ssh(host, cmd)
+            continue
+
+        # Configure SSH class if enabled
+        if ssh_class:
+            cmd += f"""
+            # Class for SSH traffic, bypassing other AQMs
+            tc class add dev eth{i} \
+                parent {htb_handle} classid {ssh_classid} \
+                htb rate 100mbit ceil 100mbit quantum {quantum};
+            tc qdisc add dev eth{i} \
+                parent {ssh_classid} handle 22: \
+                fq;
+
+            # Filter to match outgoing SSH traffic (port 22)
+            tc filter add dev eth{i} \
+                protocol ip prio 1 u32 match ip dport 22 0xffff \
+                flowid {ssh_classid};
+
+            # Filter to match incoming SSH traffic (port 22)
+            tc filter add dev eth{i} \
+                protocol ip prio 1 u32 match ip sport 22 0xffff \
+                flowid {ssh_classid};
+            """
+
+        # Add RED to routers if enabled
+        if red:
+            maxp = 1.0  # mark all packets above `maxth` queue length
+            avpkt = 1500  # Average packet size
+            limit = avpkt * 100
+
+            if congestion_control == "dctcp":
+                # Default DCTCP configuration
+                burst = 0
+                k = max(round((((bandwidth * 1024) / avpkt) * rtt) / 7), 1)
+                minth = avpkt * k
+                maxth = avpkt * (k + 1)
+            else:
+                burst = 1
+                minth = avpkt * 1
+                maxth = avpkt * 30
+
+            cmd += f"""
+            tc qdisc add dev eth{i} \
+                parent {default_classid} handle {red_handle} \
+                red limit {limit} min {minth} max {maxth} avpkt {avpkt} \
+                bandwidth {bandwidth}mbit ecn probability {maxp} burst {burst};
+            """
+
+        # Execute the command on the router
+        ssh(host, cmd)
+
+
+def cleanup_ifb():
+    """Remove Intermediate Functional Block devices."""
+    for host, i in [(host, i) for host in hosts for i in range(len(hosts[host].macs))]:
+        cmd = f"""
+        tc qdisc del dev eth{i} ingress 2>/dev/null || true
+        ip link set dev ifb{i} down 2>/dev/null || true
+        ip link delete ifb{i} 2>/dev/null || true
+        """
         ssh(host, cmd)
 
 
@@ -313,7 +421,7 @@ def base_configuration():
         ssh(host, cmd)
 
 
-def cong(congestion_control, max_rate=None, min_rtt=None):
+def cong(congestion_control, max_rate=None, min_rtt=None, static_rtt=1):
     yellow(f"Activating {(cc := congestion_control)} congestion control ...")
     for host in hosts:
         cmd = ""
@@ -329,13 +437,8 @@ def cong(congestion_control, max_rate=None, min_rtt=None):
 
             if cc == "lgcc" and min_rtt:
                 # Configure RTT
-                rtt = (
-                    # int(lgc_min_rtt / 2)
-                    min_rtt
-                    if min_rtt and host in routers
-                    else min_rtt
-                )
-                cmd += f"sysctl -w net.ipv4.{cc}.{cc}_min_rtt={rtt};"
+                cmd += f"sysctl -w net.ipv4.{cc}.{cc}_min_rtt={min_rtt};"
+                cmd += f"sysctl -w net.ipv4.{cc}.{cc}_static_rtt={static_rtt};"
 
             # Exponential smoothing paramter (default: `round(0.05*2**16)`)
             α = round(0.05 * 2**16)
@@ -351,31 +454,106 @@ def cong(congestion_control, max_rate=None, min_rtt=None):
         ssh(host, cmd)
 
 
+def debug_network_setup(host, interface):
+    """Debug network setup on a host."""
+    cmd = f"""
+    echo "=== Network Setup Debug for {host} eth{interface} ==="
+    
+    echo "\n--- IFB Device Status ---"
+    ip link show dev ifb{interface}
+    
+    echo "\n--- Ingress Qdisc on eth{interface} ---"
+    tc qdisc show dev eth{interface} ingress
+    
+    echo "\n--- Filters on eth{interface} ingress ---"
+    tc filter show dev eth{interface} parent ffff:
+    
+    echo "\n--- Netem on IFB device ---"
+    tc qdisc show dev ifb{interface}
+    
+    echo "\n--- IPTables PREROUTING Chain ---"
+    iptables -t mangle -L PREROUTING -n -v
+    
+    echo "\n--- Active Connections ---"
+    ss -tnp
+    
+    echo "\n--- System Settings ---"
+    sysctl -a | grep -E 'route_localnet|ip_forward|nonlocal_bind|rp_filter'
+    
+    echo "\n--- Loaded Modules ---"
+    lsmod | grep -E 'ifb|act_mirred|pepdna'
+    
+    echo "=== End Debug ==="
+    """
+
+    ssh(host, cmd)
+
+
+def setup_ingress_delay(delay_ms):
+    """Configure delay on ingress using IFB."""
+    pkt_limit = 1000000
+
+    for host, i in [(host, i) for host in hosts for i in range(len(hosts[host].macs))]:
+        cmd = f"""
+        echo "# Cleaning up existing configuration..."
+        # Remove existing ingress qdisc
+        tc qdisc del dev eth{i} ingress 2>/dev/null || true
+        # Remove existing IFB device
+        ip link set dev ifb{i} down 2>/dev/null || true
+        ip link delete ifb{i} 2>/dev/null || true
+
+        # echo "# Load required modules"
+        # modprobe ifb
+        # modprobe act_mirred
+
+        echo "# Create and configure IFB device"
+        ip link add ifb{i} type ifb
+        ip link set dev ifb{i} up
+
+        echo "# Setup ingress qdisc"
+        tc qdisc add dev eth{i} handle ffff: ingress
+
+        echo "# Add filter to redirect traffic"
+        tc filter add dev eth{i} parent ffff: \
+            protocol ip prio 0 \
+            u32 match u32 0 0 \
+            action mirred egress redirect dev ifb{i}
+
+        echo "# Configure netem on IFB device"
+        tc qdisc add dev ifb{i} root handle 1: \
+            netem delay {delay_ms}ms limit {pkt_limit}
+
+        echo "# Verify setup"
+        tc filter show dev eth{i} parent ffff:
+        tc qdisc show dev ifb{i}
+        """
+
+        ssh(host, cmd)
+
+
 def pepdna_enable():
     cmd = """
     if ! lsmod | grep -q '^pepdna'; then
         echo "Setting up PEP-DNA ..."
 
-        # Create or flush the DIVERT chain
+        echo "Create or flush the DIVERT chain"
         iptables -t mangle -N DIVERT 2>/dev/null || iptables -t mangle -F DIVERT
 
-        # Ensure the PREROUTING rules are in place
-        iptables -t mangle -C PREROUTING -p tcp ! --dport 22 -m socket -j DIVERT 2>/dev/null || \
-        iptables -t mangle -A PREROUTING -p tcp ! --dport 22 -m socket -j DIVERT
-
-        iptables -t mangle -C DIVERT -j MARK --set-mark 1 2>/dev/null || \
+        echo "Configure DIVERT chain"
         iptables -t mangle -A DIVERT -j MARK --set-mark 1
-
-        iptables -t mangle -C DIVERT -j ACCEPT 2>/dev/null || \
         iptables -t mangle -A DIVERT -j ACCEPT
 
-        # Add IP rule and route if they don't exist
+        echo "Add IP rule and route if they don't exist"
         ip rule list | grep -q 'fwmark 0x1 lookup 100' || ip rule add fwmark 1 lookup 100
-        ip route show table 100 | grep -q 'local 0.0.0.0/0 dev lo' || \
+        ip route show table 100 2>/dev/null | grep -q 'local 0.0.0.0/0 dev lo' || \
         ip route add local 0.0.0.0/0 dev lo table 100
 
-        # Ensure the TPROXY rule is in place
-        iptables -t mangle -C PREROUTING -p tcp ! --dport 22 -j TPROXY --tproxy-mark 1 --on-port 9999 2>/dev/null || \
+        echo "Ensure the PREROUTING rules are in place (in correct order)"
+        # First remove any existing rules
+        iptables -t mangle -F PREROUTING
+
+        # Add rules in correct order
+        iptables -t mangle -A PREROUTING -p tcp ! --dport 22 -m socket -j DIVERT
         iptables -t mangle -A PREROUTING -p tcp ! --dport 22 -j TPROXY --tproxy-mark 1 --on-port 9999
 
         echo "Set sysctl variables to allow full transparency ..."
@@ -385,7 +563,7 @@ def pepdna_enable():
         sysctl -w net.ipv4.conf.all.forwarding=1
         sysctl -w net.ipv4.conf.all.rp_filter=0
 
-        echo "Loading local PEP-DNA at the router node ..."
+        echo "Loading PEP-DNA at the router node ..."
         modprobe pepdna port=9999 mode=0
     else
         echo "PEP-DNA is already enabled."
@@ -434,8 +612,9 @@ def kill_iperf():
     for host in hosts:
         ssh(host, "pkill iperf3 || true", check=False)
 
+
 def rm_logs():
-    yellow(" Remove old log files ...")
+    yellow("Remove old log files ...")
     cmd = """
     rm -f /root/*.log;
     rm -f /root/*.log.json;
