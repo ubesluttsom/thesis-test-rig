@@ -16,10 +16,7 @@ RUN apk update && apk add --no-cache \
     curl \
     dbus \
     openrc \
-    py3-jinja2 \
-    py3-pandas \
-    py3-numpy \
-    py3-matplotlib
+    py3-jinja2
 
 COPY *.j2 /
 COPY *.py /

@@ -12,7 +12,7 @@ def main():
     global hosts, routers, vms
     try:
         # Configure topology and create host symbols
-        topology = configure_topology(senders=3)
+        topology = configure_topology(senders=2)
         hosts, routers, vms = (topology.hosts, topology.routers, topology.vms)
 
         # Create a common timestamp for all log files of this run
@@ -21,21 +21,13 @@ def main():
         # Ensure hosts are initialised properly
         base_configuration()
 
-        # If delay is specified, add netem qdisc on ingress
-        # if (delay_ms := 10):
-        #     setup_ingress_delay(delay_ms)
-
-        # pepdna_enable()
-
         # Execute actual tests
-        # execute_test(t, "lgc", max_rate=200)
-        execute_test(t, "lgcc", max_rate=200, min_rtt=102000, static_rtt=0)
-        # execute_test(t, "dctcp")
-        # execute_test(t, "bbr")
-        # execute_test(t, "cubic")
-
-        # Remove virtual devices created to induce delay
-        # cleanup_ifb()
+        execute_test(t, "lgc", max_rate=250)
+        execute_test(t, "reno")
+        execute_test(t, "lgcc", max_rate=250, min_rtt=2000, static_rtt=1)
+        execute_test(t, "dctcp")
+        execute_test(t, "bbr")
+        execute_test(t, "cubic")
 
         green("Test complete!")
     except RuntimeError as e:
@@ -65,7 +57,7 @@ def execute_test(
     if congestion_control in ["lgcc", "lgc", "dctcp"]:
         qdisc(congestion_control, red=True)
     else:  # CUBIC, Reno, BBR, ...
-        qdisc(congestion_control, red=False)
+        fq_codel()
 
     # Start logging of `cwnd`
     start_ss(congestion_control)
@@ -81,9 +73,9 @@ def execute_test(
     kill_ss()
     sleep(1)
 
-    # # Disable the PEP
-    # if congestion_control == "lgcc":
-    #     pepdna_disable()
+    # Disable the PEP
+    if congestion_control == "lgcc":
+        pepdna_disable()
 
     # Fetch the logs of the test
     copy_logs(timestamp, congestion_control)
@@ -213,74 +205,9 @@ def shq(bandwidth=50, rtt=3, delay=1):
         ssh(router, cmd)
 
 
-def qdisc_new(congestion_control=None, bandwidth=250, rtt=0.044, delay=10, red=True):
-    """
-    Configure the qdiscs with a structure using netem for delay, HTB for rate limiting, and RED for congestion control.
-    """
-    yellow(f"Deleting existing qdiscs and activating special RED with ECN ...")
-    for host, i in [(host, i) for host in hosts for i in range(len(hosts[host].macs))]:
-        print(f"Configuring qdisc on {host}, eth{i}")
-
-        # Remove existing qdiscs
-        cmd = f"""
-        set -e;
-        tc qdisc del dev eth{i} root 2>/dev/null || true;
-        """
-
-        # Define handles
-        netem_handle = "10:"
-        htb_handle = "1:1"
-        red_handle = "20:"
-
-        # Add netem qdisc for delay
-        cmd += f"""
-        tc qdisc add dev eth{i} root handle {netem_handle} netem delay {delay}ms;
-        """
-
-        # Add HTB qdisc for rate limiting as a child of netem
-        cmd += f"""
-        tc qdisc add dev eth{i} parent {netem_handle} handle {htb_handle} htb default 1;
-
-        # Add HTB class for rate limiting
-        tc class add dev eth{i} parent {htb_handle} classid 1:1 htb rate {bandwidth}mbit ceil {bandwidth}mbit quantum 300;
-        """
-
-        # On end hosts, execute the command without configuring RED
-        if host not in routers:
-            # cmd += f"""
-            # tc qdisc add dev eth{i} parent 1:1 handle {red_handle} fq maxrate {bandwidth}mbit;
-            # """
-            ssh(host, cmd)
-            continue
-
-        # Add RED to routers if enabled
-        if red:
-            maxp = 1.0  # mark all packets above `maxth` queue length
-            avpkt = 1500  # Average packet size
-            limit = avpkt * 100
-
-            if congestion_control == "dctcp":
-                # Default DCTCP configuration
-                burst = 0
-                k = max(round((((bandwidth * 1024) / avpkt) * rtt) / 7), 1)
-                minth = avpkt * k
-                maxth = avpkt * (k + 1)
-            else:
-                burst = 1
-                minth = avpkt * 1
-                maxth = avpkt * 14
-
-            cmd += f"""
-            tc qdisc add dev eth{i} parent 1:1 handle {red_handle} red limit {limit} min {minth} max {maxth} avpkt {avpkt} bandwidth {bandwidth}mbit ecn probability {maxp} burst {burst};
-            """
-
-        # Execute the command on the router
-        ssh(host, cmd)
-
-
 def qdisc(
     congestion_control=None,
-    bandwidth=300,
+    bandwidth=150,
     rtt=0.045,
     red=True,
     quantum=300,
@@ -372,6 +299,39 @@ def qdisc(
         ssh(host, cmd)
 
 
+def fq_codel(bandwidth=300):
+    """
+    Configure FQ-CoDel with bandwidth limiting and ECN.
+
+    Args:
+        bandwidth (int): Link bandwidth in Mbits
+        ssh_class (bool): Whether to create special filtering for SSH traffic
+    """
+
+    yellow(f"Deleting existing qdiscs and setting up FQ-CoDel with {bandwidth}Mbit limit...")
+    for host, i in [(host, i) for host in hosts for i in range(len(hosts[host].macs))]:
+        print(f"Configuring qdisc on {host}, eth{i}")
+
+        # Remove existing qdiscs
+        cmd = f"""
+        tc qdisc del dev eth{i} root 2>/dev/null || true;
+        """
+
+        # Add HTB root with bandwidth limit
+        cmd += f"""
+        tc qdisc add dev eth{i} root handle 1: htb default 10;
+        tc class add dev eth{i} parent 1: classid 1:10 htb rate {bandwidth}mbit ceil {bandwidth}mbit quantum 300;
+        """
+
+        # Add FQ-CoDel with ECN under HTB
+        cmd += f"""
+        tc qdisc add dev eth{i} parent 1:10 fq_codel ecn;
+        """
+
+        # Execute the command on the host
+        ssh(host, cmd)
+
+
 def cleanup_ifb():
     """Remove Intermediate Functional Block devices."""
     for host, i in [(host, i) for host in hosts for i in range(len(hosts[host].macs))]:
@@ -450,83 +410,6 @@ def cong(congestion_control, max_rate=None, min_rtt=None, static_rtt=1):
             cmd += f"echo {thresh} > /sys/module/tcp_{cc}/parameters/thresh_16;"
 
         cmd += "sysctl -p;"
-
-        ssh(host, cmd)
-
-
-def debug_network_setup(host, interface):
-    """Debug network setup on a host."""
-    cmd = f"""
-    echo "=== Network Setup Debug for {host} eth{interface} ==="
-    
-    echo "\n--- IFB Device Status ---"
-    ip link show dev ifb{interface}
-    
-    echo "\n--- Ingress Qdisc on eth{interface} ---"
-    tc qdisc show dev eth{interface} ingress
-    
-    echo "\n--- Filters on eth{interface} ingress ---"
-    tc filter show dev eth{interface} parent ffff:
-    
-    echo "\n--- Netem on IFB device ---"
-    tc qdisc show dev ifb{interface}
-    
-    echo "\n--- IPTables PREROUTING Chain ---"
-    iptables -t mangle -L PREROUTING -n -v
-    
-    echo "\n--- Active Connections ---"
-    ss -tnp
-    
-    echo "\n--- System Settings ---"
-    sysctl -a | grep -E 'route_localnet|ip_forward|nonlocal_bind|rp_filter'
-    
-    echo "\n--- Loaded Modules ---"
-    lsmod | grep -E 'ifb|act_mirred|pepdna'
-    
-    echo "=== End Debug ==="
-    """
-
-    ssh(host, cmd)
-
-
-def setup_ingress_delay(delay_ms):
-    """Configure delay on ingress using IFB."""
-    pkt_limit = 1000000
-
-    for host, i in [(host, i) for host in hosts for i in range(len(hosts[host].macs))]:
-        cmd = f"""
-        echo "# Cleaning up existing configuration..."
-        # Remove existing ingress qdisc
-        tc qdisc del dev eth{i} ingress 2>/dev/null || true
-        # Remove existing IFB device
-        ip link set dev ifb{i} down 2>/dev/null || true
-        ip link delete ifb{i} 2>/dev/null || true
-
-        # echo "# Load required modules"
-        # modprobe ifb
-        # modprobe act_mirred
-
-        echo "# Create and configure IFB device"
-        ip link add ifb{i} type ifb
-        ip link set dev ifb{i} up
-
-        echo "# Setup ingress qdisc"
-        tc qdisc add dev eth{i} handle ffff: ingress
-
-        echo "# Add filter to redirect traffic"
-        tc filter add dev eth{i} parent ffff: \
-            protocol ip prio 0 \
-            u32 match u32 0 0 \
-            action mirred egress redirect dev ifb{i}
-
-        echo "# Configure netem on IFB device"
-        tc qdisc add dev ifb{i} root handle 1: \
-            netem delay {delay_ms}ms limit {pkt_limit}
-
-        echo "# Verify setup"
-        tc filter show dev eth{i} parent ffff:
-        tc qdisc show dev ifb{i}
-        """
 
         ssh(host, cmd)
 

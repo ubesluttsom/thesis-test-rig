@@ -1,5 +1,4 @@
 from jinja2 import Environment, FileSystemLoader
-from config import context
 from config import configure_topology
 
 def main():
@@ -33,12 +32,6 @@ def main():
         output = template.render(device_name=device_name, device=device)
         with open(f"{device_name}.xml", "w") as f:
             f.write(output)
-
-    # Render the routing table script
-    template = env.get_template("routing_table.sh.j2")
-    output = template.render(devices=context["devices"])
-    with open("routing_table.sh", "w") as f:
-        f.write(output)
 
     print("Templates rendered successfully.")
 

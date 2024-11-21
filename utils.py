@@ -1,9 +1,9 @@
 import subprocess
 from datetime import datetime
 
-def run(command, **kwargs):
+def run(command, shell=True, check=True, text=True, **kwargs):
     """Helper function to run shell commands"""
-    return subprocess.run(command, shell=True, check=True, text=True, **kwargs)
+    return subprocess.run(command, shell=shell, check=check, text=text, **kwargs)
 
 
 def ssh(
