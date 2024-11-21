@@ -173,38 +173,6 @@ def copy_logs(timestamp, suffix):
     cat_files(hosts, "*.log.json")
 
 
-def shq(bandwidth=50, rtt=3, delay=1):
-    # Bandwidth is in Mbits. RTT and delay in ms.
-    yellow(f"Deleting existing qdiscs and activating ShQ ...")
-    for router, i in product(routers, range(3)):
-        cmd = f"""
-        tc qdisc del dev eth{i} root 2>/dev/null || true;
-        tc qdisc add dev eth{i} root handle 1: htb default 10;
-        tc class add dev eth{i} parent 1: classid 1:10 htb rate {bandwidth}mbit quantum 600;
-        tc qdisc add dev eth{i} parent 1:10 handle 10: netem delay {delay}ms;
-        tc qdisc add dev eth{i} parent 10: handle 11: shq limit 1000 interval {rtt} maxp 0.5 alpha 0.95 bandwidth {bandwidth}mbps ecn;
-        echo 'yay' > /root/it_works;
-        """
-        # cmd = f"""
-        # tc qdisc del dev eth{i} root 2>/dev/null || true;
-        # tc qdisc add dev eth{i} root shq limit 1000 interval {rtt} maxp 0.8 alpha 0.95 bandwidth {bandwidth}mbps ecn;
-        # """
-
-        # Prioritize SSH traffic on port 22, bypassing both ShQ and bottleneck
-        cmd += f"""
-        # Class for SSH traffic, bypassing bottleneck and RED
-        tc class add dev eth{i} parent 1: classid 1:22 htb rate 1000mbit ceil 1000mbit quantum 600;
-        tc qdisc add dev eth{i} parent 1:22 handle 22: pfifo;
-
-        # Filter to match outgoing SSH traffic (port 22)
-        tc filter add dev eth{i} protocol ip prio 1 u32 match ip dport 22 0xffff flowid 1:22;
-
-        # Filter to match incoming SSH traffic (port 22)
-        tc filter add dev eth{i} protocol ip prio 1 u32 match ip sport 22 0xffff flowid 1:22;
-        """
-        ssh(router, cmd)
-
-
 def qdisc(
     congestion_control=None,
     bandwidth=150,
@@ -308,7 +276,9 @@ def fq_codel(bandwidth=300):
         ssh_class (bool): Whether to create special filtering for SSH traffic
     """
 
-    yellow(f"Deleting existing qdiscs and setting up FQ-CoDel with {bandwidth}Mbit limit...")
+    yellow(
+        f"Deleting existing qdiscs and setting up FQ-CoDel with {bandwidth}Mbit limit..."
+    )
     for host, i in [(host, i) for host in hosts for i in range(len(hosts[host].macs))]:
         print(f"Configuring qdisc on {host}, eth{i}")
 
